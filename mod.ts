@@ -20,7 +20,9 @@ export class OpenEvent extends Event {
 
 }
 
-export type Message = Omit<PacketMessage, "payload"> & { payload: Payload };
+export type Message = Omit<PacketMessage, "payload"> & {
+    payload: Payload
+};
 
 export interface MessageEventInit extends EventInit {
     message: Message;
@@ -101,7 +103,7 @@ export type AuthResponse = Omit<ConnAckPacket, "type">;
 export type AuthHandler = (request: AuthRequest) => AuthResponse | Promise<AuthResponse>;
 
 export type PublishMessage = Omit<PacketMessage, "payload"> & {
-    payload?: Payload[keyof Payload],
+    payload?: Payload[keyof Payload] | Payload,
 };
 
 export enum MqttSocketState {
@@ -221,8 +223,21 @@ export class MqttSocket extends EventTarget {
                 : 0 as Uint16
         );
 
+        const hasProperty = <T extends symbol | string>(value: unknown, property: T): value is { [_ in T]: unknown } =>
+            typeof value === "object" &&
+            !!value && property in value;
 
-        const payload = Payload.encode(message.payload);
+        const hasBytes = (value: unknown): value is {
+            bytes: Uint8Array
+        } =>
+            hasProperty(value, "bytes") &&
+            value.bytes instanceof Uint8Array;
+
+        const payload = (
+            hasBytes(message.payload)
+                ? message.payload.bytes
+                : Payload.encode(message.payload)
+        );
 
         for (let count = 0; count < defaults.retries.publish; ++count) {
             await this.send(PacketType.Publish, {

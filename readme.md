@@ -12,7 +12,7 @@ Example usage:
 import { MqttSocket } from "./mod.ts";
 
 // Create a new MqttSocket instance
-const socket = new MqttSocket("mqtt://192.168.3.8:1883");
+const socket = new MqttSocket("mqtt://localhost");
 
 socket.addEventListener("open", async () => {
     // Subscribe to a topic
