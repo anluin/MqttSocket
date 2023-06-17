@@ -1,0 +1,5 @@
+{
+    "tasks": {
+        "test": "deno test -A --check --trace-ops ./**/*.ts"
+    }
+}

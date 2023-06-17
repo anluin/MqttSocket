@@ -1,35 +1,43 @@
-import {
-    ConnAckPacket,
-    ConnAckReturnCode,
-    ConnectPacket,
-    Message as PacketMessage,
-    Packet,
-    PacketDecodeStream,
-    PacketEncodeStream,
-    PacketType,
-    QualityOfService,
-    SubAckReturnCode,
-    Subscription
-} from "https://deno.land/x/mqttify@0.0.6/protocol/3.1.1/mod.ts";
-import { defaults, delay, Payload, Uint16, unwrappedPromise } from "https://deno.land/x/mqttify@0.0.6/utils/mod.ts";
+import { ConnAckPacket, ConnAckReturnCode, ConnectPacket, Message, Packet, PacketDecoderStream, PacketEncoderStream, PacketType, QualityOfService, SubAckReturnCode, } from "https://deno.land/x/mqttify@0.0.9/mod.ts";
+
+import { defaults } from "https://deno.land/x/mqttify@0.0.9/defaults.ts";
 
 
-export const PROTOCOL_REGEXP = /^(?<protocol>mqtt)(?<secure>s)?:/;
+export { QualityOfService, SubAckReturnCode, ConnAckReturnCode } from "https://deno.land/x/mqttify@0.0.9/mod.ts";
+
+
+export interface ItoJSON {
+    toJSON(): JSONValue;
+}
+
+export type JSONValue =
+    | string
+    | number
+    | boolean
+    | {
+    [_: string]: JSONValue
+}
+    | Array<JSONValue>
+    | ItoJSON;
 
 export class OpenEvent extends Event {
 
 }
 
-export type Message = Omit<PacketMessage, "payload"> & {
-    payload: Payload
+export type SubscribeMessage = Omit<Message, "payload"> & {
+    payload: {
+        bytes: Uint8Array,
+        text: string,
+        json: JSONValue,
+    },
 };
 
 export interface MessageEventInit extends EventInit {
-    message: Message;
+    message: SubscribeMessage;
 }
 
 export class MessageEvent extends Event {
-    message: Message;
+    message: SubscribeMessage;
 
     constructor(type: string, eventInitDict: MessageEventInit) {
         super(type, eventInitDict);
@@ -53,6 +61,11 @@ export class PacketEvent extends Event {
 export class CloseEvent extends Event {
 
 }
+
+export type Subscription = {
+    topic: string,
+    qos?: QualityOfService,
+};
 
 export interface SubscribeEventInit extends EventInit {
     subscriptions: Subscription[];
@@ -102,8 +115,17 @@ export type AuthRequest = Omit<ConnectPacket, "type">;
 export type AuthResponse = Omit<ConnAckPacket, "type">;
 export type AuthHandler = (request: AuthRequest) => AuthResponse | Promise<AuthResponse>;
 
-export type PublishMessage = Omit<PacketMessage, "payload"> & {
-    payload?: Payload[keyof Payload] | Payload,
+export type PublishMessage = {
+    topic: string,
+    payload?: string | Uint8Array | JSONValue | {
+        bytes?: Uint8Array,
+    } | {
+        text?: string,
+    } | {
+        json?: JSONValue,
+    },
+    qos?: QualityOfService,
+    retain?: boolean,
 };
 
 export enum MqttSocketState {
@@ -139,7 +161,25 @@ export interface MqttSocket {
     ): void;
 }
 
+export type MqttSocketConnectOptions = {
+    secure?: boolean,
+    hostname: string,
+    port?: number,
+    clientId?: string,
+    cleanSession?: boolean,
+    keepAlive?: number,
+    username?: string,
+    password?: string,
+};
+
+
+export const textEncoder = new TextEncoder();
+export const textDecoder = new TextDecoder();
+export const PROTOCOL_REGEXP = /^(?<protocol>mqtt)(?<secure>s)?:/;
+
 export class MqttSocket extends EventTarget {
+    private readonly timeoutIds = new Set<number>();
+
     static readonly OPEN = MqttSocketState.Open;
     static readonly CONNECTING = MqttSocketState.Connecting;
     static readonly CLOSING = MqttSocketState.Closing;
@@ -154,6 +194,8 @@ export class MqttSocket extends EventTarget {
     readonly url: URL;
     readonly keepAlive: number;
 
+    readonly closed: Promise<void>;
+
 
     constructor(url: string | URL);
     constructor(connection: Deno.Conn, authHandler?: AuthHandler);
@@ -161,53 +203,33 @@ export class MqttSocket extends EventTarget {
         super();
 
         if (urlOrConnection instanceof URL || typeof urlOrConnection === "string") {
-            this.url = (
+            const options = decodeConnectOptions(this.url = (
                 urlOrConnection instanceof URL
                     ? urlOrConnection
                     : new URL(urlOrConnection)
-            );
-
-            const protocolRegExpResult = PROTOCOL_REGEXP.exec(this.url.protocol);
-
-            if (!protocolRegExpResult) {
-                throw new Error(`unsupported protocol: "${this.url.protocol.slice(0, -1)}"`);
-            }
+            ));
 
             this.state = MqttSocketState.Connecting;
-
-            this.connect({
-                secure: !!/^mqtt(?<secure>s)?:/.exec(this.url.protocol)?.groups?.secure,
-                hostname: this.url.hostname,
-                port: (
-                    this.url.port
-                        ? parseInt(this.url.port)
-                        : defaults.port
-                ),
-                clientId: this.url.searchParams.get("clientId") || `mqttify-${crypto.randomUUID()}`,
-                cleanSession: (
-                    this.url.searchParams.has("cleanSession")
-                        ? this.url.searchParams.get("cleanSession") === "true"
-                        : !this.url.searchParams.has("clientId")
-                ),
-                keepAlive: this.keepAlive = (
-                    parseInt(this.url.searchParams.get("keepAlive")!) ||
-                    defaults.keepAlive
-                ),
-                username: this.url.username ? this.url.username : undefined,
-                password: this.url.password ? this.url.password : undefined,
+            this.keepAlive = options.keepAlive;
+            this.closed = this.connect({
+                protocol: {
+                    name: "MQTT",
+                    level: 4,
+                },
+                ...options,
             })
                 .catch(console.error);
         } else if (authHandler) {
             this.state = MqttSocketState.Connecting;
             this.url = new URL("mqtt://");
             this.keepAlive = -1;
-            this.accept(urlOrConnection, authHandler)
+            this.closed = this.accept(urlOrConnection, authHandler)
                 .catch(console.error);
         } else {
             this.state = MqttSocketState.Connecting;
             this.url = new URL("mqtt://");
             this.keepAlive = -1;
-            this.link(urlOrConnection)
+            this.closed = this.link(urlOrConnection)
                 .catch(console.error);
         }
     }
@@ -220,33 +242,39 @@ export class MqttSocket extends EventTarget {
         const id = (
             message.qos ?? 0 > 0
                 ? this.nextPacketId()
-                : 0 as Uint16
+                : 0
         );
 
-        const hasProperty = <T extends symbol | string>(value: unknown, property: T): value is { [_ in T]: unknown } =>
-            typeof value === "object" &&
-            !!value && property in value;
+        let payload = message.payload;
 
-        const hasBytes = (value: unknown): value is {
-            bytes: Uint8Array
-        } =>
-            hasProperty(value, "bytes") &&
-            value.bytes instanceof Uint8Array;
+        if (typeof payload === "object") {
+            if ("bytes" in payload) {
+                payload = payload.bytes;
+            } else if ("text" in payload) {
+                payload = payload.text;
+            } else if ("json" in payload) {
+                payload = payload.json;
+            }
+        }
 
-        const payload = (
-            hasBytes(message.payload)
-                ? message.payload.bytes
-                : Payload.encode(message.payload)
-        );
+        if (!(payload instanceof Uint8Array)) {
+            if (typeof payload !== "string") {
+                payload = JSON.stringify(payload);
+            }
+
+            if (typeof payload === "string") {
+                payload = textEncoder.encode(payload);
+            }
+        }
 
         for (let count = 0; count < defaults.retries.publish; ++count) {
             await this.send(PacketType.Publish, {
                 id,
-                dup: false,
-                message: {
-                    ...message,
-                    payload,
-                },
+                dup: !!count,
+                topic: message.topic,
+                payload: payload,
+                qos: message.qos ?? QualityOfService.atMostOnce,
+                retain: false,
             });
 
             switch (message.qos ?? 0) {
@@ -298,30 +326,45 @@ export class MqttSocket extends EventTarget {
         throw new Deno.errors.TimedOut();
     }
 
-    async subscribe(subscriptions: Subscription[]): Promise<SubAckReturnCode[]> {
-        const id = this.nextPacketId();
+    async subscribe(topic: string, qos?: QualityOfService): Promise<SubAckReturnCode> ;
+    async subscribe(subscriptions: Subscription[]): Promise<SubAckReturnCode[]> ;
+    async subscribe(topicOrSubscriptions: string | Subscription[], optionalQos?: QualityOfService): Promise<SubAckReturnCode | SubAckReturnCode[]> {
+        if (topicOrSubscriptions instanceof Array) {
+            const id = this.nextPacketId();
 
-        for (let count = 0; count < defaults.retries.suback; ++count) {
-            await this.send(PacketType.Subscribe, {
-                id,
-                subscriptions,
-            });
+            for (let count = 0; count < defaults.retries.suback; ++count) {
+                await this.send(PacketType.Subscribe, {
+                    id,
+                    subscriptions: topicOrSubscriptions.map((subscription) => ({
+                        topic: subscription.topic,
+                        qos: (
+                            subscription.qos ??
+                            QualityOfService.atMostOnce
+                        ),
+                    })),
+                });
 
-            try {
-                return await (
-                    this.receive(PacketType.SubAck, defaults.timeouts.suback, id)
-                        .then(({ returnCodes }) => returnCodes)
-                );
-            } catch (error) {
-                if (error instanceof Deno.errors.TimedOut) {
-                    continue;
+                try {
+                    return await (
+                        this.receive(PacketType.SubAck, defaults.timeouts.suback, id)
+                            .then(({ returnCodes }) => returnCodes)
+                    );
+                } catch (error) {
+                    if (error instanceof Deno.errors.TimedOut) {
+                        continue;
+                    }
+
+                    throw error;
                 }
-
-                throw error;
             }
-        }
 
-        throw new Deno.errors.TimedOut();
+            throw new Deno.errors.TimedOut();
+        } else {
+            return (await this.subscribe([ {
+                topic: topicOrSubscriptions,
+                qos: optionalQos,
+            } ]))[0];
+        }
     }
 
     async unsubscribe(topics: string[]): Promise<void> {
@@ -373,6 +416,8 @@ export class MqttSocket extends EventTarget {
         type: T
     }>>;
     async receive<T extends Packet["type"]>(typeOrTimeout: T | number, optionalTimeout?: number, id?: number) {
+        let timeoutId: number | undefined;
+
         return await new Promise<Extract<Packet, {
             type: T
         }>>((resolve, reject) => {
@@ -382,24 +427,30 @@ export class MqttSocket extends EventTarget {
                     : [ undefined, typeOrTimeout as number ]
             );
 
-            const timeoutId = (
-                timeout > 0
-                    ? setTimeout(() => {
-                        this.removeEventListener("packet", listener);
-                        reject(new Deno.errors.TimedOut(JSON.stringify({
-                            type,
-                            timeout,
-                            id,
-                        })));
-                    }, timeout)
-                    : -1
-            );
+            if (timeout > 0) {
+                this.timeoutIds.add(timeoutId = setTimeout(() => {
+                    this.removeEventListener("packet", listener);
+                    this.timeoutIds.delete(timeoutId!);
+                    timeoutId = undefined;
+
+                    reject(new Deno.errors.TimedOut(JSON.stringify({
+                        type,
+                        timeout,
+                        id,
+                    })));
+                }, timeout));
+            }
 
             const listener = (event: PacketEvent) => {
                 if ((type === undefined || event.packet.type === type) && (id === undefined || ("id" in event.packet && event.packet.id === id))) {
-                    clearTimeout(timeoutId);
-                    event.preventDefault();
                     this.removeEventListener("packet", listener);
+                    event.preventDefault();
+
+                    if (timeoutId) {
+                        clearTimeout(timeoutId);
+                        this.timeoutIds.delete(timeoutId);
+                    }
+
                     resolve(event.packet as Extract<Packet, {
                         type: T
                     }>);
@@ -411,8 +462,15 @@ export class MqttSocket extends EventTarget {
     }
 
     initKeepAliveTimeout() {
-        this.keepAliveTimeoutId ?? clearTimeout(this.keepAliveTimeoutId);
+        if (this.keepAliveTimeoutId) {
+            this.timeoutIds.delete(this.keepAliveTimeoutId);
+            clearTimeout(this.keepAliveTimeoutId);
+        }
+
         this.keepAliveTimeoutId = setTimeout(async () => {
+            this.timeoutIds.delete(this.keepAliveTimeoutId!);
+            this.keepAliveTimeoutId = undefined;
+
             await this.send(PacketType.PingReq, {});
 
             try {
@@ -449,48 +507,48 @@ export class MqttSocket extends EventTarget {
 
                 break;
         }
+
+        for (const timeoutId of this.timeoutIds) {
+            clearTimeout(timeoutId);
+        }
+
+        this.timeoutIds.clear();
     }
 
     private nextPacketId() {
-        return ((this.packetIdCounter = (this.packetIdCounter ?? 0) % 2 ** 16) + 1) as Uint16;
+        return ((this.packetIdCounter = (this.packetIdCounter ?? 0) % 2 ** 16) + 1);
     }
 
     private async link(connection: Deno.Conn, andThen?: (readable: ReadableStream<Packet>, writable: WritableStream<Packet>) => Promise<void>) {
-        const packetDecodeStream = new PacketDecodeStream();
-        const packetEncodeStream = new PacketEncodeStream();
+        const packetDecoderStream = new PacketDecoderStream();
+        const packetEncoderStream = new PacketEncoderStream();
         const handleUnload = () => this.close();
 
         try {
             globalThis.addEventListener("unload", handleUnload);
 
-            const {
-                promise,
-                reject,
-            } = unwrappedPromise();
-
             await Promise.race([
-                connection.readable.pipeTo(packetDecodeStream.writable),
-                packetEncodeStream.readable.pipeTo(connection.writable),
-                promise,
+                connection.readable.pipeTo(packetDecoderStream.writable),
+                packetEncoderStream.readable.pipeTo(connection.writable),
                 (async () => {
-                    await andThen?.(packetDecodeStream.readable, packetEncodeStream.writable);
+                    await andThen?.(packetDecoderStream.readable, packetEncoderStream.writable);
 
-                    this.writer = packetEncodeStream.writable.getWriter();
+                    this.writer = packetEncoderStream.writable.getWriter();
                     this.state = MqttSocketState.Open;
                     this.connection = connection;
 
                     this.dispatchEvent(new OpenEvent("open"));
 
-                    for await (const packet of packetDecodeStream.readable) {
+                    for await (const packet of packetDecoderStream.readable) {
                         this.dispatchEvent(new PacketEvent("packet", {
                             packet,
                         }));
 
                         (async () => {
                             switch (packet.type) {
-                                case PacketType.Publish:
+                                case PacketType.Publish: {
                                     qos:
-                                        switch (packet.message.qos ?? 0) {
+                                        switch (packet.qos ?? 0) {
                                             case QualityOfService.atLeastOnce:
                                                 await this.send(PacketType.PubAck, packet);
 
@@ -516,14 +574,38 @@ export class MqttSocket extends EventTarget {
                                                 throw new Deno.errors.TimedOut();
                                         }
 
+                                    const {
+                                        topic,
+                                        payload,
+                                        qos,
+                                        retain,
+                                    } = packet;
+
                                     this.dispatchEvent(new MessageEvent("message", {
                                         message: {
-                                            ...packet.message,
-                                            payload: Payload.decode(packet.message.payload),
+                                            qos,
+                                            retain,
+                                            topic,
+                                            payload: {
+                                                bytes: payload,
+                                                get text() {
+                                                    return textDecoder.decode(this.bytes);
+                                                },
+                                                set text(value: string) {
+                                                    this.bytes = textEncoder.encode(value);
+                                                },
+                                                get json() {
+                                                    return JSON.parse(this.text);
+                                                },
+                                                set json(value: JSONValue) {
+                                                    this.text = JSON.stringify(value);
+                                                },
+                                            },
                                         },
                                     }));
 
                                     break;
+                                }
                                 case PacketType.Subscribe:
                                     // TODO: expose suback via event?
                                     await this.send(PacketType.SubAck, {
@@ -549,7 +631,7 @@ export class MqttSocket extends EventTarget {
                                     break;
                             }
                         })()
-                            .catch(reject);
+                            .catch(console.error);
                     }
                 })(),
             ]);
@@ -576,10 +658,13 @@ export class MqttSocket extends EventTarget {
                 const writer = writable.getWriter();
                 const reader = readable.getReader();
 
+                let timeoutId = -1;
+
                 const packet = await Promise.race([
                     reader.read().then(({ value }) => value),
-                    delay(defaults.timeouts.connect),
-                ]);
+                    new Promise<undefined>(resolve => timeoutId = setTimeout(resolve, defaults.timeouts.connect)),
+                ])
+                    .finally(() => clearTimeout(timeoutId));
 
                 if (packet?.type !== PacketType.Connect) {
                     throw new Error(`received unexpected packet: #${packet?.type}`);
@@ -631,7 +716,55 @@ export class MqttSocket extends EventTarget {
 
                 reader.releaseLock();
                 writer.releaseLock();
+
+                if (packet.returnCode !== ConnAckReturnCode.ConnectionAccepted) {
+                    throw new Deno.errors.ConnectionRefused(undefined, { cause: packet.returnCode });
+                }
             },
         );
     }
 }
+
+export const encodeConnectOptions = (options: MqttSocketConnectOptions) => {
+    const url = new URL(`${options.secure ? "mqtts" : "mqtt"}://${options.hostname}:${options.port ?? defaults.port}`);
+
+    if (options.clientId !== undefined) url.searchParams.set("clientId", options.clientId);
+    if (options.cleanSession !== undefined) url.searchParams.set("cleanSession", `${options.cleanSession}`);
+    if (options.keepAlive !== undefined) url.searchParams.set("keepAlive", `${options.keepAlive}`);
+    if (options.username !== undefined) url.username = options.username;
+    if (options.password !== undefined) url.password = options.password;
+
+    return url;
+};
+
+export const decodeConnectOptions = (url: string | URL) => {
+    url = url instanceof URL ? url : new URL(url);
+
+    const protocolRegExpResult = PROTOCOL_REGEXP.exec(url.protocol);
+
+    if (!protocolRegExpResult) {
+        throw new Error(`unsupported protocol: "${url.protocol.slice(0, -1)}"`);
+    }
+
+    return {
+        secure: !!protocolRegExpResult?.groups?.secure,
+        hostname: url.hostname,
+        port: (
+            url.port
+                ? parseInt(url.port)
+                : defaults.port
+        ),
+        clientId: url.searchParams.get("clientId") || `mqttify-${crypto.randomUUID()}`,
+        cleanSession: (
+            url.searchParams.has("cleanSession")
+                ? url.searchParams.get("cleanSession") === "true"
+                : !url.searchParams.has("clientId")
+        ),
+        keepAlive: (
+            parseInt(url.searchParams.get("keepAlive")!) ||
+            defaults.keepAlive
+        ),
+        username: url.username ? url.username : undefined,
+        password: url.password ? url.password : undefined,
+    }
+};
