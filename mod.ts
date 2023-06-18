@@ -20,11 +20,32 @@ export type JSONValue =
     | Array<JSONValue>
     | ItoJSON;
 
-export class OpenEvent extends Event {
-
+export interface OpenEventInit extends EventInit {
+    clientId: string,
+    cleanSession: boolean,
+    sessionPresent: boolean,
+    keepAlive: number,
+    will?: PublishedMessage;
 }
 
-export type SubscribeMessage = Omit<Message, "payload"> & {
+export class OpenEvent extends Event {
+    clientId: string;
+    cleanSession: boolean;
+    sessionPresent: boolean;
+    keepAlive: number;
+    will?: PublishedMessage;
+
+    constructor(type: string, eventInitDict: OpenEventInit) {
+        super(type, eventInitDict);
+        this.clientId = eventInitDict.clientId;
+        this.cleanSession = eventInitDict.cleanSession;
+        this.sessionPresent = eventInitDict.sessionPresent;
+        this.keepAlive = eventInitDict.keepAlive;
+        this.will = eventInitDict.will;
+    }
+}
+
+export type PublishedMessage = Omit<Message, "payload"> & {
     payload: {
         bytes: Uint8Array,
         text: string,
@@ -33,11 +54,11 @@ export type SubscribeMessage = Omit<Message, "payload"> & {
 };
 
 export interface MessageEventInit extends EventInit {
-    message: SubscribeMessage;
+    message: PublishedMessage;
 }
 
 export class MessageEvent extends Event {
-    message: SubscribeMessage;
+    message: PublishedMessage;
 
     constructor(type: string, eventInitDict: MessageEventInit) {
         super(type, eventInitDict);
@@ -103,14 +124,6 @@ export interface MqttSocketEventMap {
     unsubscribe: UnsubscribeEvent;
 }
 
-type HandshakeOptions = Omit<ConnectPacket, "type">;
-
-type ConnectOptions = {
-    secure: boolean,
-    hostname: string,
-    port: number,
-} & HandshakeOptions;
-
 export type AuthRequest = Omit<ConnectPacket, "type">;
 export type AuthResponse = Omit<ConnAckPacket, "type">;
 export type AuthHandler = (request: AuthRequest) => AuthResponse | Promise<AuthResponse>;
@@ -162,61 +175,81 @@ export interface MqttSocket {
 }
 
 export type MqttSocketConnectOptions = {
-    secure?: boolean,
-    hostname: string,
-    port?: number,
     clientId?: string,
     cleanSession?: boolean,
     keepAlive?: number,
+    will?: PublishMessage,
+};
+
+export type MqttSocketUrlOptions = {
+    secure: boolean,
+    hostname: string,
+    port?: number,
     username?: string,
     password?: string,
 };
 
+type HandshakeOptions = Omit<ConnectPacket, "type">;
+
+type ConnectOptions = {
+    secure: boolean,
+    hostname: string,
+    port: number,
+} & HandshakeOptions;
 
 export const textEncoder = new TextEncoder();
 export const textDecoder = new TextDecoder();
 export const PROTOCOL_REGEXP = /^(?<protocol>mqtt)(?<secure>s)?:/;
 
 export class MqttSocket extends EventTarget {
-    private readonly timeoutIds = new Set<number>();
-
     static readonly OPEN = MqttSocketState.Open;
     static readonly CONNECTING = MqttSocketState.Connecting;
     static readonly CLOSING = MqttSocketState.Closing;
     static readonly CLOSED = MqttSocketState.Closed;
-
+    readonly url: URL;
+    readonly keepAlive: number;
+    readonly closed: Promise<void>;
+    private readonly timeoutIds = new Set<number>();
     private state: MqttSocketState;
     private connection?: Deno.Conn;
     private writer?: WritableStreamDefaultWriter<Packet>;
     private packetIdCounter?: number;
     private keepAliveTimeoutId?: number;
 
-    readonly url: URL;
-    readonly keepAlive: number;
-
-    readonly closed: Promise<void>;
-
-
-    constructor(url: string | URL);
+    constructor(url: string | URL, connectOptions?: MqttSocketConnectOptions);
     constructor(connection: Deno.Conn, authHandler?: AuthHandler);
-    constructor(urlOrConnection: string | URL | Deno.Conn, authHandler?: AuthHandler) {
+    constructor(urlOrConnection: string | URL | Deno.Conn, authHandlerOrConnectOptions?: AuthHandler | MqttSocketConnectOptions) {
         super();
 
+        const [ authHandler, connectOptions ] = (
+            authHandlerOrConnectOptions instanceof Function
+                ? [ authHandlerOrConnectOptions, undefined ]
+                : [ undefined, authHandlerOrConnectOptions ]
+        );
+
         if (urlOrConnection instanceof URL || typeof urlOrConnection === "string") {
-            const options = decodeConnectOptions(this.url = (
+            const urlOptions = decodeUrlOptions(this.url = (
                 urlOrConnection instanceof URL
                     ? urlOrConnection
                     : new URL(urlOrConnection)
             ));
 
             this.state = MqttSocketState.Connecting;
-            this.keepAlive = options.keepAlive;
+            this.keepAlive = connectOptions?.keepAlive ?? defaults.keepAlive;
             this.closed = this.connect({
                 protocol: {
                     name: "MQTT",
                     level: 4,
                 },
-                ...options,
+                clientId: connectOptions?.clientId || `mqttify-${crypto.randomUUID()}`,
+                cleanSession: connectOptions?.cleanSession ?? !connectOptions?.clientId,
+                keepAlive: (
+                    connectOptions?.keepAlive ??
+                    defaults.keepAlive
+                ),
+                port: defaults.port,
+                will: connectOptions?.will && encodePublishMessage(connectOptions.will),
+                ...urlOptions,
             })
                 .catch(console.error);
         } else if (authHandler) {
@@ -245,36 +278,11 @@ export class MqttSocket extends EventTarget {
                 : 0
         );
 
-        let payload = message.payload;
-
-        if (typeof payload === "object") {
-            if ("bytes" in payload) {
-                payload = payload.bytes;
-            } else if ("text" in payload) {
-                payload = payload.text;
-            } else if ("json" in payload) {
-                payload = payload.json;
-            }
-        }
-
-        if (!(payload instanceof Uint8Array)) {
-            if (typeof payload !== "string") {
-                payload = JSON.stringify(payload);
-            }
-
-            if (typeof payload === "string") {
-                payload = textEncoder.encode(payload);
-            }
-        }
-
         for (let count = 0; count < defaults.retries.publish; ++count) {
             await this.send(PacketType.Publish, {
                 id,
                 dup: !!count,
-                topic: message.topic,
-                payload: payload,
-                qos: message.qos ?? QualityOfService.atMostOnce,
-                retain: false,
+                ...encodePublishMessage(message),
             });
 
             switch (message.qos ?? 0) {
@@ -478,7 +486,7 @@ export class MqttSocket extends EventTarget {
                 this.initKeepAliveTimeout();
             } catch (error) {
                 if (error instanceof Deno.errors.TimedOut) {
-                    this.close();
+                    await this.close();
                     return;
                 }
 
@@ -487,23 +495,22 @@ export class MqttSocket extends EventTarget {
         }, Math.max(1000, this.keepAlive) - 100);
     }
 
+    async disconnect() {
+        await this.send(PacketType.Disconnect, {});
+        await this.close();
+    }
+
     close() {
         switch (this.state) {
             case MqttSocketState.Connecting:
             case MqttSocketState.Open:
                 this.state = MqttSocketState.Closing;
-                this.dispatchEvent(new CloseEvent("close"));
-                this.send(PacketType.Disconnect, {})
-                    .then(() => {
-                        this.writer = undefined;
+                this.writer = undefined;
 
-                        try {
-                            ([ , this.connection ] = [ this.connection, undefined ])[0]
-                                ?.close();
-                        } catch (_) {
-                            // ignore error
-                        }
-                    });
+                (
+                    [ , this.connection ] =
+                        [ this.connection, undefined ]
+                )[0]?.close();
 
                 break;
         }
@@ -536,8 +543,6 @@ export class MqttSocket extends EventTarget {
                     this.writer = packetEncoderStream.writable.getWriter();
                     this.state = MqttSocketState.Open;
                     this.connection = connection;
-
-                    this.dispatchEvent(new OpenEvent("open"));
 
                     for await (const packet of packetDecoderStream.readable) {
                         this.dispatchEvent(new PacketEvent("packet", {
@@ -574,34 +579,8 @@ export class MqttSocket extends EventTarget {
                                                 throw new Deno.errors.TimedOut();
                                         }
 
-                                    const {
-                                        topic,
-                                        payload,
-                                        qos,
-                                        retain,
-                                    } = packet;
-
                                     this.dispatchEvent(new MessageEvent("message", {
-                                        message: {
-                                            qos,
-                                            retain,
-                                            topic,
-                                            payload: {
-                                                bytes: payload,
-                                                get text() {
-                                                    return textDecoder.decode(this.bytes);
-                                                },
-                                                set text(value: string) {
-                                                    this.bytes = textEncoder.encode(value);
-                                                },
-                                                get json() {
-                                                    return JSON.parse(this.text);
-                                                },
-                                                set json(value: JSONValue) {
-                                                    this.text = JSON.stringify(value);
-                                                },
-                                            },
-                                        },
+                                        message: decodePublishedMessage(packet),
                                     }));
 
                                     break;
@@ -648,6 +627,7 @@ export class MqttSocket extends EventTarget {
             globalThis.removeEventListener("unload", handleUnload);
             this.close();
             this.state = MqttSocketState.Closed;
+            this.dispatchEvent(new CloseEvent("close"));
         }
     }
 
@@ -660,34 +640,42 @@ export class MqttSocket extends EventTarget {
 
                 let timeoutId = -1;
 
-                const packet = await Promise.race([
+                const connectPacket = await Promise.race([
                     reader.read().then(({ value }) => value),
                     new Promise<undefined>(resolve => timeoutId = setTimeout(resolve, defaults.timeouts.connect)),
                 ])
                     .finally(() => clearTimeout(timeoutId));
 
-                if (packet?.type !== PacketType.Connect) {
-                    throw new Error(`received unexpected packet: #${packet?.type}`);
+                if (connectPacket?.type !== PacketType.Connect) {
+                    throw new Error(`received unexpected packet: #${connectPacket?.type}`);
                 }
 
                 const {
                     type: _,
-                    ...request
-                } = packet;
+                    ...authRequest
+                } = connectPacket;
 
-                const response = await authHandler(request);
+                const authResponse = await authHandler(authRequest);
 
                 await writer.write({
                     type: PacketType.ConnAck,
-                    ...response,
+                    ...authResponse,
                 });
 
                 reader.releaseLock();
                 writer.releaseLock();
 
-                if (response.returnCode !== ConnAckReturnCode.ConnectionAccepted) {
+                if (authResponse.returnCode !== ConnAckReturnCode.ConnectionAccepted) {
                     throw new Error("connection rejected");
                 }
+
+                this.dispatchEvent(new OpenEvent("open", {
+                    clientId: connectPacket.clientId,
+                    cleanSession: connectPacket.cleanSession,
+                    sessionPresent: authResponse.sessionPresent,
+                    keepAlive: connectPacket.keepAlive,
+                    will: connectPacket.will && decodePublishedMessage(connectPacket.will),
+                }));
             },
         );
     }
@@ -708,36 +696,102 @@ export class MqttSocket extends EventTarget {
 
                 this.initKeepAliveTimeout();
 
-                const { value: packet } = await reader.read();
+                const { value: connackPacket } = await reader.read();
 
-                if (packet?.type !== PacketType.ConnAck) {
-                    throw new Error(`received unexpected packet: #${packet?.type}`);
+                if (connackPacket?.type !== PacketType.ConnAck) {
+                    throw new Error(`received unexpected packet: #${connackPacket?.type}`);
                 }
 
                 reader.releaseLock();
                 writer.releaseLock();
 
-                if (packet.returnCode !== ConnAckReturnCode.ConnectionAccepted) {
-                    throw new Deno.errors.ConnectionRefused(undefined, { cause: packet.returnCode });
+                if (connackPacket.returnCode !== ConnAckReturnCode.ConnectionAccepted) {
+                    throw new Deno.errors.ConnectionRefused(undefined, { cause: connackPacket.returnCode });
                 }
+
+                this.dispatchEvent(new OpenEvent("open", {
+                    clientId: options.clientId,
+                    cleanSession: options.cleanSession,
+                    sessionPresent: connackPacket.sessionPresent,
+                    keepAlive: options.keepAlive,
+                    will: options.will && decodePublishedMessage(options.will),
+                }));
             },
         );
     }
 }
 
-export const encodeConnectOptions = (options: MqttSocketConnectOptions) => {
+export const encodePublishMessage = (message: PublishMessage): Message => {
+    let payload = message.payload;
+
+    if (typeof payload === "object") {
+        if ("bytes" in payload) {
+            payload = payload.bytes;
+        } else if ("text" in payload) {
+            payload = payload.text;
+        } else if ("json" in payload) {
+            payload = payload.json;
+        }
+    }
+
+    if (!(payload instanceof Uint8Array)) {
+        if (typeof payload !== "string") {
+            payload = JSON.stringify(payload);
+        }
+
+        if (typeof payload === "string") {
+            payload = textEncoder.encode(payload);
+        }
+    }
+
+    return {
+        topic: message.topic,
+        payload: payload,
+        qos: message.qos ?? QualityOfService.atMostOnce,
+        retain: false,
+    };
+};
+
+export const decodePublishedMessage = (message: Message): PublishedMessage => {
+    const {
+        topic,
+        payload,
+        qos,
+        retain,
+    } = message;
+
+    return {
+        qos,
+        retain,
+        topic,
+        payload: {
+            bytes: payload,
+            get text() {
+                return textDecoder.decode(this.bytes);
+            },
+            set text(value: string) {
+                this.bytes = textEncoder.encode(value);
+            },
+            get json() {
+                return JSON.parse(this.text);
+            },
+            set json(value: JSONValue) {
+                this.text = JSON.stringify(value);
+            },
+        },
+    };
+};
+
+export const encodeUrlOptions = (options: MqttSocketUrlOptions) => {
     const url = new URL(`${options.secure ? "mqtts" : "mqtt"}://${options.hostname}:${options.port ?? defaults.port}`);
 
-    if (options.clientId !== undefined) url.searchParams.set("clientId", options.clientId);
-    if (options.cleanSession !== undefined) url.searchParams.set("cleanSession", `${options.cleanSession}`);
-    if (options.keepAlive !== undefined) url.searchParams.set("keepAlive", `${options.keepAlive}`);
     if (options.username !== undefined) url.username = options.username;
     if (options.password !== undefined) url.password = options.password;
 
     return url;
 };
 
-export const decodeConnectOptions = (url: string | URL) => {
+export const decodeUrlOptions = (url: string | URL): MqttSocketUrlOptions => {
     url = url instanceof URL ? url : new URL(url);
 
     const protocolRegExpResult = PROTOCOL_REGEXP.exec(url.protocol);
@@ -753,16 +807,6 @@ export const decodeConnectOptions = (url: string | URL) => {
             url.port
                 ? parseInt(url.port)
                 : defaults.port
-        ),
-        clientId: url.searchParams.get("clientId") || `mqttify-${crypto.randomUUID()}`,
-        cleanSession: (
-            url.searchParams.has("cleanSession")
-                ? url.searchParams.get("cleanSession") === "true"
-                : !url.searchParams.has("clientId")
-        ),
-        keepAlive: (
-            parseInt(url.searchParams.get("keepAlive")!) ||
-            defaults.keepAlive
         ),
         username: url.username ? url.username : undefined,
         password: url.password ? url.password : undefined,

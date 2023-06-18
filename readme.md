@@ -4,14 +4,15 @@
 
 This project is an implementation of a high-level abstraction of the MQTT protocol using Deno.
 
-It contains a `WebSocket`-like class that can handle MQTT connections. The `MqttSocket` class provides methods for publishing messages, subscribing to topics, and handling authentication. The class also emits events for when the connection is opened, a message is received, a packet is sent or received, an error occurs, the connection is closed, a subscription is made, or an unsubscription is made.
+It contains a `WebSocket`-like class that can handle MQTT connections. The `MqttSocket` class provides methods for publishing messages, subscribing to topics, and handling authentication. The class also emits events for when the connection
+is opened, a message is received, a packet is sent or received, an error occurs, the connection is closed, a subscription is made, or an unsubscription is made.
 
 [![deno module](https://shield.deno.dev/x/mqttsocket)](https://deno.land/x/mqttsocket)
 
 ## Usage
 
 ```typescript
-import { MqttSocket } from "./mod.ts";
+import { MqttSocket } from "https://deno.land/x/mqttsocket/mod.ts";
 
 
 // Create a new MqttSocket instance
