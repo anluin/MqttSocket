@@ -250,20 +250,17 @@ export class MqttSocket extends EventTarget {
                 port: defaults.port,
                 will: connectOptions?.will && encodePublishMessage(connectOptions.will),
                 ...urlOptions,
-            })
-                .catch(console.error);
+            });
         } else if (authHandler) {
             this.state = MqttSocketState.Connecting;
             this.url = new URL("mqtt://");
             this.keepAlive = -1;
-            this.closed = this.accept(urlOrConnection, authHandler)
-                .catch(console.error);
+            this.closed = this.accept(urlOrConnection, authHandler);
         } else {
             this.state = MqttSocketState.Connecting;
             this.url = new URL("mqtt://");
             this.keepAlive = -1;
-            this.closed = this.link(urlOrConnection)
-                .catch(console.error);
+            this.closed = this.link(urlOrConnection);
         }
     }
 
@@ -507,10 +504,14 @@ export class MqttSocket extends EventTarget {
                 this.state = MqttSocketState.Closing;
                 this.writer = undefined;
 
-                (
-                    [ , this.connection ] =
-                        [ this.connection, undefined ]
-                )[0]?.close();
+                try {
+                    (
+                        [ , this.connection ] =
+                            [ this.connection, undefined ]
+                    )[0]?.close();
+                } catch (error) {
+                    // ignore error
+                }
 
                 break;
         }
@@ -534,9 +535,12 @@ export class MqttSocket extends EventTarget {
         try {
             globalThis.addEventListener("unload", handleUnload);
 
+            let reject: (error: unknown) => void;
+
             await Promise.race([
                 connection.readable.pipeTo(packetDecoderStream.writable),
                 packetEncoderStream.readable.pipeTo(connection.writable),
+                new Promise((...args) => [ , reject ] = args),
                 (async () => {
                     await andThen?.(packetDecoderStream.readable, packetEncoderStream.writable);
 
@@ -572,7 +576,7 @@ export class MqttSocket extends EventTarget {
                                                             continue;
                                                         }
 
-                                                        throw new error;
+                                                        throw error;
                                                     }
                                                 }
 
@@ -610,7 +614,7 @@ export class MqttSocket extends EventTarget {
                                     break;
                             }
                         })()
-                            .catch(console.error);
+                            .catch(reject!);
                     }
                 })(),
             ]);
@@ -746,9 +750,9 @@ export const encodePublishMessage = (message: PublishMessage): Message => {
 
     return {
         topic: message.topic,
-        payload: payload,
+        payload: payload ?? new Uint8Array(),
         qos: message.qos ?? QualityOfService.atMostOnce,
-        retain: false,
+        retain: message.retain ?? false,
     };
 };
 
